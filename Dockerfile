@@ -36,5 +36,14 @@ COPY schema /workspace/schema
 # and every contributor scores the same bytes.
 COPY quality /workspace/quality
 
+# ------------------------------------------------------------------ non-root --
+# The image runs as an unprivileged user. Runtime writable locations (outputs,
+# HF cache) are group-writable so an arbitrary `docker run --user UID:GID`
+# (what quickstart.sh always passes) keeps working regardless of the host uid.
+RUN useradd --create-home --uid 1000 --user-group ecocompute \
+ && mkdir -p /workspace/outputs /workspace/models/.hf \
+ && chmod 0777 /workspace/outputs /workspace/models /workspace/models/.hf
+USER ecocompute
+
 ENTRYPOINT ["python3", "/workspace/entrypoint.py"]
 CMD ["energy_estimate"]

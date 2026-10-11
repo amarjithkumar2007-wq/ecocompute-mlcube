@@ -14,5 +14,11 @@ COPY entrypoint.py /workspace/entrypoint.py
 COPY workspace/parameters /workspace/parameters
 COPY schema /workspace/schema
 
+# Non-root, matching the production image (see Dockerfile).
+RUN useradd --create-home --uid 1000 --user-group ecocompute \
+ && mkdir -p /workspace/outputs \
+ && chmod 0777 /workspace/outputs
+USER ecocompute
+
 ENTRYPOINT ["python3", "/workspace/entrypoint.py"]
 CMD ["energy_estimate"]

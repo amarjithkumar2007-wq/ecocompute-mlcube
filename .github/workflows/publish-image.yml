@@ -61,7 +61,9 @@ jobs:
       - name: Smoke-test the published image (no GPU on the runner)
         run: |
           mkdir -p out
-          docker run --rm -v "$PWD/out:/workspace/outputs" \
+          # --user: the image's default user is unprivileged (uid 1000); write to
+          # the bind mount as the runner's own uid, like quickstart.sh does.
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/out:/workspace/outputs" \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest energy_estimate \
             --dry_run --gpu_arch ada --params_b 1.1 --output_dir /workspace/outputs
           python3 -c "

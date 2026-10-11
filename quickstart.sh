@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 # EcoCompute energy MLCube - zero-configuration runner.
 #
-#   curl -fsSL https://raw.githubusercontent.com/hongping-zh/ecocompute-mlcube/main/quickstart.sh | bash
+# Recommended way to run this (verify before you execute - a release is
+# immutable and checksummed; `main` is neither):
+#
+#   curl -fsSLO https://github.com/hongping-zh/ecocompute-mlcube/releases/download/schema-1.3-r3/quickstart.sh
+#   curl -fsSLO https://github.com/hongping-zh/ecocompute-mlcube/releases/download/schema-1.3-r3/SHA256SUMS
+#   sha256sum -c SHA256SUMS
+#   bash quickstart.sh
+#
+# `bash quickstart.sh --dry-run` prints the whole plan - the mode it would
+# pick, every directory it would touch, every environment variable it reads,
+# and the exact commands - and exits without doing anything.
 #
 # One measurement of one (GPU x model x precision) configuration against its own
 # FP16 baseline on the machine you run it on: samples GPU power with NVML, writes
@@ -10,9 +20,26 @@
 #
 # Two ways to get there, picked automatically and no flags either way (the
 # architecture is read from the NVML device name):
-#   docker  - pull the prebuilt image and run it (nothing installed on the host);
+#   docker  - pull the prebuilt image and run it (nothing installed on the
+#             host; the container runs as your uid:gid, never root);
 #   native  - no Docker (AutoDL / vast.ai / other rented containers cannot nest
 #             it): clone the repo and install into a venv on the data disk.
+#
+# What this script changes on your machine, in full:
+#   both modes   - creates $ECOCOMPUTE_OUT (default ./ecocompute-out) and
+#                  writes the report and the overlay link into it. Nothing
+#                  outside the directories listed here is written.
+#   docker mode  - creates $ECOCOMPUTE_CACHE (default ~/.cache/ecocompute-hf)
+#                  and bind-mounts exactly two paths into the container:
+#                  $ECOCOMPUTE_OUT -> /workspace/outputs and
+#                  $ECOCOMPUTE_CACHE -> /workspace/models/.hf. The model is
+#                  downloaded into the cache. No host packages are installed.
+#   native mode  - creates a checkout ($ECOCOMPUTE_SRC, else the data disk,
+#                  else ~/.cache/ecocompute/src), a venv inside it, installs
+#                  the pinned requirements, and downloads the model into an
+#                  HF cache on the same disk. Re-running updates in place.
+# It reads, and never writes, the ECOCOMPUTE_* variables listed below. It does
+# not touch your shell profile, system packages or GPU drivers.
 #
 # Overrides:
 #
@@ -20,23 +47,45 @@
 #   ECOCOMPUTE_PARAMS_B    size in billions (default 1.1 - must match the model)
 #   ECOCOMPUTE_PRECISION   NF4 | INT8       (default NF4; FP16 is always measured too)
 #   ECOCOMPUTE_ITERATIONS  decode runs      (default 10, as in the published dataset)
-#   ECOCOMPUTE_IMAGE       image ref        (default ghcr.io/hongping-zh/ecocompute-mlcube:latest)
+#   ECOCOMPUTE_IMAGE       image ref        (default ghcr.io/hongping-zh/ecocompute-mlcube:latest;
+#                          pin a digest from the release page for a reproducible image)
 #   ECOCOMPUTE_OUT         output directory (default ./ecocompute-out)
 #   ECOCOMPUTE_GPU_ARGS    docker GPU flags (default "--gpus all"; e.g. --gpus "device=1")
 #   ECOCOMPUTE_NO_BUILD=1  fail instead of building locally when the pull fails
 #   ECOCOMPUTE_MODE        docker | native  (default: docker if usable, else native)
 #   ECOCOMPUTE_REF         git ref to clone (default: main). Pin a release tag
-#                          (e.g. schema-1.3-r1) for a reproducible native run;
+#                          (e.g. schema-1.3-r3) for a reproducible native run;
 #                          existing checkouts at another ref are re-cloned.
 #   ECOCOMPUTE_SRC         checkout dir for native mode (default: on the data disk)
 #   ECOCOMPUTE_PREFETCH=1  ask the site for its prediction first and print it next
 #                          to your measurement (one HTTPS GET; off by default)
 #   ECOCOMPUTE_QUALITY=0   skip the perplexity probe (on by default; it runs after
 #                          the power sampler stops, so it never enters the energy)
+#   ECOCOMPUTE_READONLY=1  docker mode: add --read-only and a tmpfs /tmp, so the
+#                          container's filesystem is immutable apart from the two
+#                          mounts above (hardening; report a failure on your host)
 #   ECOCOMPUTE_ALLOW_FALLBACK=1
 #                          native mode: run even when the quantization backend is
 #                          broken (the report will not be a measurement)
 set -euo pipefail
+
+# ----------------------------------------------------------------- arguments --
+# The script is driven by environment variables; the only CLI flags it takes
+# are --dry-run (print the plan, execute nothing) and --help.
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|--dry_run) DRY_RUN=1 ;;
+    -h|--help)
+      # print the header comment (everything up to `set -euo pipefail`)
+      hdr_end=$(awk 'NR>1 && /^set -euo/ {print NR-1; exit}' "$0")
+      sed -n "2,${hdr_end}p" "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      printf '[error] unknown argument: %s (this script takes --dry-run only; configuration is via ECOCOMPUTE_* environment variables)\n' "$arg" >&2
+      exit 1 ;;
+  esac
+done
 
 IMAGE="${ECOCOMPUTE_IMAGE:-ghcr.io/hongping-zh/ecocompute-mlcube:latest}"
 MODEL="${ECOCOMPUTE_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
@@ -118,6 +167,50 @@ if [ -z "$MODE" ]; then
     MODE=native
     say "no usable Docker here (rented GPU containers usually cannot nest it) - installing into a venv instead. Force with ECOCOMPUTE_MODE=docker|native."
   fi
+fi
+
+# ------------------------------------------------------------------ dry run --
+# Print the resolved plan and exit. Mode detection above is read-only
+# (command -v / docker info), so a dry run never writes anything; everything
+# below this block is where side effects start.
+if [ "$DRY_RUN" = 1 ]; then
+  say "dry run - nothing below is executed"
+  printf '  mode            : %s\n' "$MODE"
+  printf '  workload        : %s (%s B), %s vs FP16, %s iterations + 2 warmups\n' \
+    "$MODEL" "$PARAMS_B" "$PRECISION" "$ITERATIONS"
+  printf '  output dir      : %s  (created if missing; report + overlay link land here)\n' "$OUT"
+  if [ "$MODE" = docker ]; then
+    printf '  image           : %s\n' "$IMAGE"
+    printf '  model cache     : %s  (created if missing)\n' "$CACHE"
+    printf '  runs as         : uid %s, gid %s (never root; --user is always passed)\n' \
+      "$(id -u)" "$(id -g)"
+    printf '  host mounts     : %s -> /workspace/outputs\n' "$OUT"
+    printf '                     %s -> /workspace/models/.hf\n' "$CACHE"
+    printf '  readonly rootfs : %s\n' \
+      "$([ "${ECOCOMPUTE_READONLY:-0}" = 1 ] && echo 'yes (--read-only + tmpfs /tmp)' || echo 'no (set ECOCOMPUTE_READONLY=1)')"
+    printf '  commands        : docker pull %s\n' "$IMAGE"
+    printf '                     docker run --rm --user %s:%s %s %s%s \\\n' \
+      "$(id -u)" "$(id -g)" "${GPU_ARGS[*]}" \
+      "$([ "${ECOCOMPUTE_READONLY:-0}" = 1 ] && echo '--read-only --tmpfs /tmp:rw,size=1g ' || echo '')" \
+      "-v $OUT:/workspace/outputs -v $CACHE:/workspace/models/.hf ..."
+    printf '                     ... energy_estimate --model %s --params_b %s --precision %s --gpu_arch auto --iterations %s --warmup 2 --output_dir /workspace/outputs %s\n' \
+      "$MODEL" "$PARAMS_B" "$PRECISION" "$ITERATIONS" "${EXTRA_ARGS[*]}"
+  else
+    if   [ -n "${ECOCOMPUTE_SRC:-}" ]; then SRC="$ECOCOMPUTE_SRC"
+    elif [ -d /root/autodl-tmp ];     then SRC=/root/autodl-tmp/ecocompute/src
+    else SRC="$HOME/.cache/ecocompute/src"; fi
+    printf '  checkout        : %s  (git clone --depth 1 --branch %s, or update if already there)\n' "$SRC" "$REPO_REF"
+    printf '  venv + installs : inside the checkout; pinned requirements from that ref\n'
+    printf '  model cache     : on the same disk (the setup script picks the HF cache dir)\n'
+    printf '  commands        : git clone --depth 1 --branch %s https://github.com/hongping-zh/ecocompute-mlcube.git %s\n' "$REPO_REF" "$SRC"
+    printf '                     bash %s/autodl/00_setup.sh   (creates the venv, installs the pins)\n' "$SRC"
+    printf '                     %s/entrypoint.py energy_estimate --model %s --params_b %s --precision %s --gpu_arch auto --iterations %s --warmup 2 --output_dir %s %s\n' \
+      "$SRC" "$MODEL" "$PARAMS_B" "$PRECISION" "$ITERATIONS" "$OUT" "${EXTRA_ARGS[*]}"
+  fi
+  printf '  env vars read   : ECOCOMPUTE_MODEL PARAMS_B PRECISION ITERATIONS IMAGE OUT GPU_ARGS\n'
+  printf '                     MODE REF SRC CACHE PREFETCH QUALITY NO_BUILD READONLY ALLOW_FALLBACK\n'
+  say "dry run - nothing was executed. Re-run without --dry-run to measure."
+  exit 0
 fi
 
 mkdir -p "$OUT"
@@ -232,8 +325,18 @@ fi
 say "measuring $PRECISION vs FP16 on $MODEL ($ITERATIONS decode iterations each)"
 say "first run also downloads the model into $CACHE"
 measure() {
+  # --user: the container never runs as root, whoever invokes the script.
+  # --read-only + tmpfs /tmp (ECOCOMPUTE_READONLY=1): the container root
+  # filesystem becomes immutable; the only writable paths are the two mounts
+  # and /tmp. Opt-in because library write locations vary across hosts.
+  local readonly_args=()
+  if [ "${ECOCOMPUTE_READONLY:-0}" = "1" ]; then
+    # shellcheck disable=SC2054  # the comma is docker's tmpfs option syntax
+    readonly_args=(--read-only --tmpfs /tmp:rw,size=1g)
+  fi
   docker run --rm "$@" \
     --user "$(id -u):$(id -g)" \
+    "${readonly_args[@]}" \
     -e HOME=/workspace/models/.hf \
     -e HF_HOME=/workspace/models/.hf \
     -v "$OUT:/workspace/outputs" \

@@ -25,30 +25,53 @@ is reproducible on any CUDA GPU.
 > run.** There is no accuracy target and no LoadGen. Numbers produced here are
 > **not certified benchmark results**.
 
-## Quick start — one command, no configuration
+## Quick start — three commands, no configuration
 
-On any host with an NVIDIA GPU:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hongping-zh/ecocompute-mlcube/main/quickstart.sh | bash
-```
-
-**Pinned variant (recommended for reproducibility).** The one-liner above
-executes whatever `main` currently holds. To run an exact, checksummed release
-instead — the same thing every time, immune to repository drift:
+On any host with an NVIDIA GPU. Download the script from an immutable release,
+check it against the published checksum, then run it — never pipe a moving
+branch into a shell:
 
 ```bash
-curl -fsSL -o quickstart.sh \
-  https://github.com/hongping-zh/ecocompute-mlcube/releases/download/schema-1.3-r1/quickstart.sh
-sha256sum quickstart.sh   # expect 5664b5a131de9458f8dadda6389de44cfc24e9cc51dbac5128d02023482ac1a7
-ECOCOMPUTE_REF=schema-1.3-r1 bash quickstart.sh   # native path checks out the release tag
+curl -fsSLO https://github.com/hongping-zh/ecocompute-mlcube/releases/download/schema-1.3-r3/quickstart.sh
+curl -fsSLO https://github.com/hongping-zh/ecocompute-mlcube/releases/download/schema-1.3-r3/SHA256SUMS
+sha256sum -c SHA256SUMS && bash quickstart.sh
 ```
 
-and pin the image (docker path) by digest rather than the mutable `:latest`:
+What you run is therefore a specific, checksummed, immutable version — not
+whatever `main` happens to hold at the moment you type the command. To see the
+whole plan before anything executes:
 
 ```bash
-ECOCOMPUTE_IMAGE=ghcr.io/hongping-zh/ecocompute-mlcube@sha256:595e6ddf9658237fdfe222a9929cada024ea2d4dd1c5ae41195d024082247568
+bash quickstart.sh --dry-run   # prints mode, directories touched, env, commands; executes nothing
 ```
+
+**Supply-chain properties of this release** (details in the release notes):
+
+- the script and its `SHA256SUMS` are release assets — immutable once published;
+- the container image is published with a **digest** (below) so `:latest` drift
+  cannot change what you run;
+- an **SBOM** (CycloneDX, generated from the pinned `requirements.lock.txt` at
+  the release commit) ships as a release asset;
+- the image runs **non-root**: an unprivileged `ecocompute` user by default, and
+  `quickstart.sh` always passes `--user $(id -u):$(id -g)`;
+- `ECOCOMPUTE_READONLY=1` adds `--read-only` + a `tmpfs /tmp`, leaving only the
+  two bind mounts writable;
+- the release notes record the exact commit, the CI build and the image digest.
+
+To pin the image (docker path) by digest rather than the mutable `:latest`:
+
+```bash
+ECOCOMPUTE_IMAGE=ghcr.io/hongping-zh/ecocompute-mlcube@sha256:<digest from the release page>
+```
+
+Release `schema-1.3-r3` (2026-10-11): supply-chain hardening. The quickstart
+is published as a checksummed release asset and verified before execution
+(`curl | bash` is no longer the documented way in); `--dry-run` prints the
+complete plan without executing it; the container image drops to a non-root
+user; `ECOCOMPUTE_READONLY=1` optionally makes the container root filesystem
+read-only. Assets: `quickstart.sh`, `SHA256SUMS` (just the script, so
+`sha256sum -c` needs no flags), `SHA256SUMS.all` (schema + validator + SBOM)
+and `sbom.cdx.json`.
 
 Release `schema-1.3-r2` (2026-09-27): the semantic validator hardened. A
 hand-built negative probe (non-NVML `method`, `iterations: 1`, no window
@@ -150,13 +173,14 @@ device name, so a run cannot silently label an RTX 4090 as Blackwell. If you
 would rather read the script first, it is [`quickstart.sh`](quickstart.sh), and
 it prints every command it runs.
 
-Common overrides (all optional):
+Common overrides (all optional — on the quickstart you already downloaded and
+verified above):
 
 ```bash
 ECOCOMPUTE_PRECISION=INT8 \
 ECOCOMPUTE_MODEL=Qwen/Qwen2.5-3B ECOCOMPUTE_PARAMS_B=3 \
 ECOCOMPUTE_PREFETCH=1 \
-  bash -c "$(curl -fsSL https://raw.githubusercontent.com/hongping-zh/ecocompute-mlcube/main/quickstart.sh)"
+  bash quickstart.sh
 ```
 
 `--share` is always on in the quickstart (it only builds a link locally).
@@ -164,10 +188,12 @@ ECOCOMPUTE_PREFETCH=1 \
 before measuring, so it stays opt-in — see below. `ECOCOMPUTE_QUALITY=0` turns
 off the perplexity probe.
 
-Or drive the image yourself:
+Or drive the image yourself (the image's default user is unprivileged; passing
+`--user` makes the report land in a directory you own):
 
 ```bash
-docker run --rm --gpus all \
+mkdir -p out
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v "$PWD/out:/workspace/outputs" \
   ghcr.io/hongping-zh/ecocompute-mlcube:latest energy_estimate \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --params_b 1.1 \
