@@ -468,8 +468,22 @@ def _assert_power_readable(pynvml, handle):
         ) from e
 
 
+def _fit_prompt_to_context_length(tok, text, context_length):
+    """Tokenize ``text``, then tile/truncate the ids to exactly ``context_length``.
+
+    The measured input should span the requested context length: without this the
+    fixed one-sentence prompt (~20 tokens) is measured whatever ``context_length``
+    says, making the recorded value nominal rather than real.
+    """
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    if not ids:
+        raise ValueError("tokenizer produced no tokens for the measurement prompt")
+    reps = (context_length + len(ids) - 1) // len(ids)
+    return (ids * reps)[:context_length]
+
+
 def measure_once(model_name, precision, batch_size, tokens, iterations, warmup, hz,
-                 quality=None, trace=False):
+                 quality=None, trace=False, context_length=2048):
     """Load, (quantize,) warm up, then measure energy over `iterations` decode runs.
 
     Raises PowerUnsupportedError if the card cannot report power, so the caller can
@@ -491,7 +505,7 @@ def measure_once(model_name, precision, batch_size, tokens, iterations, warmup, 
         return _measure_with_handle(
             pynvml, handle, gpu_name, model_name, precision, batch_size,
             tokens, iterations, warmup, hz, torch, AutoModelForCausalLM, AutoTokenizer,
-            quality=quality, trace=trace)
+            quality=quality, trace=trace, context_length=context_length)
     finally:
         try:
             pynvml.nvmlShutdown()
@@ -501,7 +515,8 @@ def measure_once(model_name, precision, batch_size, tokens, iterations, warmup, 
 
 def _measure_with_handle(pynvml, handle, gpu_name, model_name, precision, batch_size,
                          tokens, iterations, warmup, hz, torch,
-                         AutoModelForCausalLM, AutoTokenizer, quality=None, trace=False):
+                         AutoModelForCausalLM, AutoTokenizer, quality=None, trace=False,
+                         context_length=2048):
     # Optional whole-run power trace (schema 1.3). Started BEFORE the tokenizer/
     # model load so that, unlike every published bitsandbytes report so far, the
     # window can be re-cut post hoc (generation-only vs whole-process) from the
@@ -527,8 +542,17 @@ def _measure_with_handle(pynvml, handle, gpu_name, model_name, precision, batch_
         if tracer:
             phases["model_ready_s"] = tracer.elapsed()
 
-        prompt = ["Explain in detail how large language models work."] * batch_size
-        enc = tok(prompt, return_tensors="pt", padding=True).to("cuda")
+        max_pos = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+        if max_pos and context_length > max_pos:
+            print("[ecocompute-mlcube] context_length=%d exceeds the model's maximum "
+                  "(%d); clamping to %d" % (context_length, max_pos, max_pos),
+                  file=sys.stderr)
+            context_length = max_pos
+        ids = _fit_prompt_to_context_length(
+            tok, "Explain in detail how large language models work.", context_length)
+        input_ids = torch.tensor([ids] * batch_size, dtype=torch.long).to("cuda")
+        enc = {"input_ids": input_ids,
+               "attention_mask": torch.ones_like(input_ids)}
 
         gen = dict(max_new_tokens=tokens, min_new_tokens=tokens, do_sample=False,
                    pad_token_id=tok.pad_token_id)
@@ -998,12 +1022,14 @@ def run(args):
         try:
             measured = measure_once(p["model_name"], p["precision"], int(p["batch_size"]),
                                     int(p["tokens"]), int(p["iterations"]), int(p["warmup"]),
-                                    int(p["sample_rate_hz"]), quality=quality, trace=trace)
+                                    int(p["sample_rate_hz"]), quality=quality, trace=trace,
+                                    context_length=int(p.get("context_length", 2048)))
             if p["precision"] != "FP16":
                 fp16_measured = measure_once(p["model_name"], "FP16", int(p["batch_size"]),
                                              int(p["tokens"]), int(p["iterations"]),
                                              int(p["warmup"]), int(p["sample_rate_hz"]),
-                                             quality=quality, trace=trace)
+                                             quality=quality, trace=trace,
+                                             context_length=int(p.get("context_length", 2048)))
         except Exception as e:  # NVML/driver/arch/OOM issue -> fall back, don't crash
             measure_error = str(e)
             hint = _quantization_backend_hint(p["precision"])

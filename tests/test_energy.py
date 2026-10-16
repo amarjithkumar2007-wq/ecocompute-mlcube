@@ -766,3 +766,37 @@ def test_regression_check_prefers_an_anchor_at_the_same_size(tmp_path, capsys):
     # that agrees with the anchor must pass even though it is far from the fit.
     assert _run_check(tmp_path, _report(de=146.0)) == 0
     assert "anchors at this size" in capsys.readouterr().out
+
+
+# --- context_length -----------------------------------------------------------
+
+def _fake_ids_tok(n_tokens):
+    """Tokenizer stub: every text yields the same n_tokens id list."""
+    def tok(_text, add_special_tokens=None, **_kw):
+        return {"input_ids": list(range(1, n_tokens + 1))}
+    return tok
+
+
+def test_fit_prompt_tiles_a_short_prompt_up_to_context_length():
+    ids = ecc._fit_prompt_to_context_length(_fake_ids_tok(7), "prompt", 20)
+    assert len(ids) == 20
+    assert ids[:7] == list(range(1, 8))       # first tile
+    assert ids[7:14] == list(range(1, 8))     # second tile
+    assert ids[14:] == list(range(1, 7))      # truncated third tile
+
+
+def test_fit_prompt_truncates_a_long_prompt_to_context_length():
+    ids = ecc._fit_prompt_to_context_length(_fake_ids_tok(100), "prompt", 32)
+    assert ids == list(range(1, 33))
+
+
+def test_fit_prompt_rejects_an_empty_tokenization():
+    with pytest.raises(ValueError):
+        ecc._fit_prompt_to_context_length(_fake_ids_tok(0), "prompt", 16)
+
+
+def test_context_length_cli_flows_into_workload(tmp_path):
+    report = run_cli(tmp_path, "--context_length", "512",
+                     "--gpu_arch", "blackwell", "--params_b", "3")
+    jsonschema.validate(report, SCHEMA)
+    assert report["workload"]["context_length"] == 512
