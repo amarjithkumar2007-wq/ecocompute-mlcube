@@ -221,9 +221,9 @@ reference report (clearly flagged, never a fabricated measurement).
 
 **AMD GPUs (ROCm).** On-device power telemetry is NVML-based and therefore
 NVIDIA-only. On a ROCm host the entrypoint detects the AMD device, says so
-clearly, and produces the dataset-derived reference report (flagged as derived,
-never a fresh measurement) instead of dying with an opaque NVML error. Native
-ROCm power telemetry is future work.
+clearly, and reports the energy values as `unavailable` rather than borrowing
+an NVIDIA fitted curve — a cross-vendor extrapolation would be worse than no
+number. Native ROCm power telemetry (rocm-smi / rocprof) is future work.
 
 ```bash
 git clone https://github.com/hongping-zh/ecocompute-mlcube.git
