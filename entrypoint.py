@@ -131,6 +131,28 @@ def probe_gpu_name():
         return None
 
 
+def probe_amd_gpu_name():
+    """AMD GPU name on a ROCm host, or None when no AMD device is visible.
+
+    ROCm builds of PyTorch map torch.cuda onto HIP, so torch.cuda.is_available()
+    is True there even though there is no NVIDIA driver for NVML to talk to.
+    Detect that case explicitly so the run can skip the doomed NVML attempt and
+    say why, instead of failing with an opaque NVML error.
+
+    Detection trusts torch.version.hip alone (that is what ROCm builds set) and
+    does not substring-match the device name: a name check would mislabel the
+    hip-nvcc edge case (ROCm PyTorch on NVIDIA hardware) the other way, and the
+    fallback here is the safe outcome for both.
+    """
+    try:
+        import torch
+        if getattr(torch.version, "hip", None) and torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return None
+
+
 def reference_pins():
     """The published pins (requirements.txt), as {package: version}."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
@@ -673,7 +695,8 @@ def build_power_trace_block(files, sample_rate_hz):
     }
 
 
-def build_report(p, measured, ref, fp16_measured=None, measure_error=None):
+def build_report(p, measured, ref, fp16_measured=None, measure_error=None,
+                 amd_gpu=None):
     arch = norm_arch(p["gpu_arch"])
     scenario = "SingleStream" if int(p["batch_size"]) == 1 else "Offline"
     report = {
@@ -690,7 +713,8 @@ def build_report(p, measured, ref, fp16_measured=None, measure_error=None):
         ),
         "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
         "system_under_test": {
-            "gpu": (measured or {}).get("gpu_name") or REFERENCE["gpu_label"].get(arch, p["gpu_arch"]),
+            "gpu": (measured or {}).get("gpu_name") or p.get("amd_gpu_name")
+                   or REFERENCE["gpu_label"].get(arch, p["gpu_arch"]),
             "gpu_arch": arch or p["gpu_arch"],
             "accelerator_count": 1,
             "host": platform.platform(),
@@ -752,6 +776,14 @@ def build_report(p, measured, ref, fp16_measured=None, measure_error=None):
             note = ("On-device NVML measurement could not run on this GPU/driver "
                     f"({measure_error}) — values derived from the published EcoCompute "
                     "measurements, not a fresh on-device measurement.")
+        elif amd_gpu:
+            source = "ecocompute-dataset (AMD GPU detected, NVML is NVIDIA-only)"
+            note = ("AMD GPU detected (%s) — NVML power telemetry works only on "
+                    "NVIDIA GPUs, so no on-device measurement was attempted, and "
+                    "no EcoCompute reference exists for AMD (borrowing an NVIDIA "
+                    "curve would be a cross-vendor extrapolation). Energy values "
+                    "are reported as unavailable; native ROCm power telemetry "
+                    "(rocm-smi) is future work." % amd_gpu)
         else:
             source = "ecocompute-dataset (no local GPU)"
             note = ("No local NVIDIA GPU detected — values derived from the published "
@@ -764,6 +796,10 @@ def build_report(p, measured, ref, fp16_measured=None, measure_error=None):
             "basis": ref["basis"],
             "note": note,
         }
+    if amd_gpu:
+        # Schema types nvidia_driver as a string; on an AMD host it must be
+        # absent, never null.
+        report["software"].pop("nvidia_driver", None)
     return report
 
 
@@ -934,6 +970,21 @@ def run(args):
     p = load_params(args)
     os.makedirs(args.output_dir, exist_ok=True)
     resolve_arch(p)
+    amd_gpu = None if args.dry_run else probe_amd_gpu_name()
+    if amd_gpu:
+        # Never let the "blackwell" load_params() default (or an explicit NVIDIA
+        # class) label an AMD host: the fitted energy curves are NVIDIA-only, and
+        # borrowing one would be a cross-vendor extrapolation.
+        if p.get("gpu_arch") not in (None, "", "auto", "amd-rocm"):
+            print("[ecocompute-mlcube] AMD GPU detected (%s): ignoring gpu_arch=%s "
+                  "- the fitted energy curves are NVIDIA-only."
+                  % (amd_gpu, p["gpu_arch"]), file=sys.stderr)
+        p["gpu_arch"] = "amd-rocm"
+        p["amd_gpu_name"] = amd_gpu
+        print("[ecocompute-mlcube] AMD GPU detected (%s): NVML power telemetry is "
+              "NVIDIA-only, so no on-device measurement is possible; energy values "
+              "are reported as unavailable rather than extrapolated from an NVIDIA "
+              "curve." % amd_gpu, file=sys.stderr)
     arch = norm_arch(p["gpu_arch"])
     if getattr(args, "prefetch", False):
         prefetch_prediction(getattr(args, "api_base", DEFAULT_API_BASE),
@@ -941,7 +992,7 @@ def run(args):
                             int(p["batch_size"]))
     measured = fp16_measured = ref = None
     measure_error = None
-    if gpu_available() and not args.dry_run:
+    if gpu_available() and not args.dry_run and not amd_gpu:
         quality = resolve_quality(p)  # only the measuring path can score quality
         trace = bool(p.get("power_trace"))
         try:
@@ -971,7 +1022,8 @@ def run(args):
             ref = {"energy_per_token_mj": None, "fp16_energy_per_token_mj": None,
                    "vs_fp16_energy_pct": None, "basis": "unavailable"}
 
-    report = build_report(p, measured, ref, fp16_measured, measure_error=measure_error)
+    report = build_report(p, measured, ref, fp16_measured,
+                          measure_error=measure_error, amd_gpu=amd_gpu)
     link = share_url(getattr(args, "site", DEFAULT_SITE), report) if getattr(args, "share", False) else None
     if link:
         report["share_url"] = link
