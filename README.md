@@ -219,6 +219,12 @@ printed summary say it is not a measurement.
 No GPU needed for a smoke test — the container falls back to a dataset-derived
 reference report (clearly flagged, never a fabricated measurement).
 
+**AMD GPUs (ROCm).** On-device power telemetry is NVML-based and therefore
+NVIDIA-only. On a ROCm host the entrypoint detects the AMD device, says so
+clearly, and produces the dataset-derived reference report (flagged as derived,
+never a fresh measurement) instead of dying with an opaque NVML error. Native
+ROCm power telemetry is future work.
+
 ```bash
 git clone https://github.com/hongping-zh/ecocompute-mlcube.git
 cd ecocompute-mlcube
