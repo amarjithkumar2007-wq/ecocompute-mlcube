@@ -134,6 +134,78 @@ def test_measure_failure_falls_back_without_claiming_measured():
     assert "NVML" in report["results"]["note"]
 
 
+# --- AMD / ROCm detection (no real GPU needed) -------------------------------
+
+def _fake_rocm_torch(hip, available, name=None):
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip=hip)
+    fake.cuda = types.SimpleNamespace(
+        is_available=lambda: available,
+        get_device_name=lambda _i: name,
+    )
+    return fake
+
+
+def test_probe_amd_gpu_name_is_none_without_rocm(monkeypatch):
+    """CUDA-only torch (or no torch at all) never reports an AMD device."""
+    monkeypatch.setitem(sys.modules, "torch",
+                        _fake_rocm_torch(hip=None, available=True,
+                                    name="NVIDIA GeForce RTX 4090"))
+    assert ecc.probe_amd_gpu_name() is None
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert ecc.probe_amd_gpu_name() is None
+
+
+def test_probe_amd_gpu_name_reads_the_rocm_device(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch",
+                        _fake_rocm_torch(hip="6.1", available=True,
+                                    name="AMD Radeon RX 7900 XTX"))
+    assert ecc.probe_amd_gpu_name() == "AMD Radeon RX 7900 XTX"
+
+
+def test_probe_amd_gpu_name_survives_a_broken_torch(monkeypatch):
+    """A torch whose CUDA probe raises must not take the run down with it."""
+    fake = types.ModuleType("torch")
+    fake.version = types.SimpleNamespace(hip="6.1")
+    def _boom():
+        raise RuntimeError("HIP error")
+    fake.cuda = types.SimpleNamespace(is_available=_boom)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    assert ecc.probe_amd_gpu_name() is None
+
+
+def test_amd_gpu_skips_nvml_and_falls_back_with_a_clear_note(tmp_path, monkeypatch):
+    """ROCm host: no doomed NVML attempt, an honest derived report, and a note
+    that names the card and says why nothing was measured."""
+    monkeypatch.setattr(ecc, "probe_amd_gpu_name",
+                        lambda: "AMD Radeon RX 7900 XTX")
+    # ROCm torch reports cuda.is_available() == True; measurement must still be skipped.
+    monkeypatch.setattr(ecc, "gpu_available", lambda: True)
+    def _no_measure(*a, **k):
+        raise AssertionError("NVML measurement must not be attempted on an AMD GPU")
+    monkeypatch.setattr(ecc, "measure_once", _no_measure)
+    args = _ns(gpu_arch="blackwell", params_b=3,
+               output_dir=str(tmp_path), dry_run=False)
+    ecc.run(args)
+    report = json.loads((tmp_path / "energy.json").read_text())
+    jsonschema.validate(report, SCHEMA)
+    assert report["results"]["basis"] != "measured"
+    assert "AMD GPU" in report["measurement_source"]
+    assert "AMD Radeon RX 7900 XTX" in report["results"]["note"]
+    assert "only on NVIDIA GPUs" in report["results"]["note"]
+
+
+def test_nvidia_run_is_unaffected_by_the_amd_probe(tmp_path, monkeypatch):
+    """No AMD device -> the usual no-GPU fallback text, unchanged."""
+    monkeypatch.setattr(ecc, "probe_amd_gpu_name", lambda: None)
+    args = _ns(gpu_arch="blackwell", params_b=3,
+               output_dir=str(tmp_path), dry_run=False)
+    ecc.run(args)
+    report = json.loads((tmp_path / "energy.json").read_text())
+    jsonschema.validate(report, SCHEMA)
+    assert "no local GPU" in report["measurement_source"]
+
+
 # --- website hooks: --share overlay link + --prefetch (no network needed) -----
 
 def _decode_overlay(url):
